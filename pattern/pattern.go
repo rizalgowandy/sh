@@ -34,6 +34,7 @@ const (
 	Filenames                     // "*" and "?" don't match slashes; only "**" does
 	Braces                        // support "{a,b}" and "{1..4}"
 	EntireString                  // match the entire string using ^$ delimiters
+	NoGlobCase                    // Do case-insensitive match (that is, use (?i) in the regexp)
 )
 
 var numRange = regexp.MustCompile(`^([+-]?\d+)\.\.([+-]?\d+)}`)
@@ -68,6 +69,9 @@ noopLoop:
 	// Enable matching `\n` with the `.` metacharacter as globs match `\n`
 	buf.WriteString("(?s)")
 	dotMeta := false
+	if mode&NoGlobCase != 0 {
+		buf.WriteString("(?i)")
+	}
 	if mode&EntireString != 0 {
 		buf.WriteString("^")
 	}
@@ -242,7 +246,7 @@ writeLoop:
 	if mode&EntireString != 0 {
 		buf.WriteString("$")
 	}
-	// No `.` metacharacters were used, so don't return the flag.
+	// No `.` metacharacters were used, so don't return the (?s) flag.
 	if !dotMeta {
 		return string(buf.Bytes()[4:]), nil
 	}
@@ -278,8 +282,8 @@ func charClass(s string) (string, error) {
 // For example, HasMeta(`foo\*bar`) returns false, but HasMeta(`foo*bar`)
 // returns true.
 //
-// This can be useful to avoid extra work, like TranslatePattern. Note that this
-// function cannot be used to avoid QuotePattern, as backslashes are quoted by
+// This can be useful to avoid extra work, like [Regexp]. Note that this
+// function cannot be used to avoid [QuoteMeta], as backslashes are quoted by
 // that function but ignored here.
 func HasMeta(pat string, mode Mode) bool {
 	for i := 0; i < len(pat); i++ {
@@ -319,17 +323,17 @@ loop:
 	if !needsEscaping { // short-cut without a string copy
 		return pat
 	}
-	var buf bytes.Buffer
+	var sb strings.Builder
 	for _, r := range pat {
 		switch r {
 		case '*', '?', '[', '\\':
-			buf.WriteByte('\\')
+			sb.WriteByte('\\')
 		case '{':
 			if mode&Braces != 0 {
-				buf.WriteByte('\\')
+				sb.WriteByte('\\')
 			}
 		}
-		buf.WriteRune(r)
+		sb.WriteRune(r)
 	}
-	return buf.String()
+	return sb.String()
 }

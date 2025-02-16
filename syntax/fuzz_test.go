@@ -1,8 +1,6 @@
 // Copyright (c) 2016, Daniel Martí <mvdan@mvdan.cc>
 // See LICENSE for licensing information
 
-//go:build go1.18
-
 package syntax
 
 import (
@@ -12,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	qt "github.com/frankban/quicktest"
+	"github.com/go-quicktest/qt"
 )
 
 func FuzzQuote(f *testing.F) {
@@ -44,13 +42,13 @@ func FuzzQuote(f *testing.F) {
 		var shellProgram string
 		switch lang {
 		case LangBash:
-			hasBash51(t)
+			requireBash52(t)
 			shellProgram = "bash"
 		case LangPOSIX:
-			hasDash059(t)
+			requireDash059(t)
 			shellProgram = "dash"
 		case LangMirBSDKorn:
-			hasMksh59(t)
+			requireMksh59(t)
 			shellProgram = "mksh"
 		case LangBats:
 			t.Skip() // bats has no shell and its syntax is just bash
@@ -63,10 +61,10 @@ func FuzzQuote(f *testing.F) {
 		if err != nil {
 			t.Fatalf("parse error on %q quoted as %s: %v", s, quoted, err)
 		}
-		qt.Assert(t, len(f.Stmts), qt.Equals, 1, qt.Commentf("in: %q, quoted: %s", s, quoted))
+		qt.Assert(t, qt.Equals(len(f.Stmts), 1), qt.Commentf("in: %q, quoted: %s", s, quoted))
 		call, ok := f.Stmts[0].Cmd.(*CallExpr)
-		qt.Assert(t, ok, qt.IsTrue, qt.Commentf("in: %q, quoted: %s", s, quoted))
-		qt.Assert(t, len(call.Args), qt.Equals, 1, qt.Commentf("in: %q, quoted: %s", s, quoted))
+		qt.Assert(t, qt.IsTrue(ok), qt.Commentf("in: %q, quoted: %s", s, quoted))
+		qt.Assert(t, qt.Equals(len(call.Args), 1), qt.Commentf("in: %q, quoted: %s", s, quoted))
 
 		// Also check that the single word only uses literals or quoted strings.
 		Walk(call.Args[0], func(node Node) bool {

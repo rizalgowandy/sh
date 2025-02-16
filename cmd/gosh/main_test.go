@@ -6,8 +6,10 @@ package main
 import (
 	"fmt"
 	"io"
+	"os"
 	"testing"
 
+	"github.com/go-quicktest/qt"
 	"mvdan.cc/sh/v3/interp"
 )
 
@@ -173,20 +175,38 @@ var interactiveTests = []struct {
 		},
 		wantErr: "1:1: reached EOF without matching ( with )",
 	},
+	{
+		pairs: []string{
+			"gosh_alias arg || true\n",
+			"\"gosh_alias\": executable file not found in $PATH\n$ ",
+			"alias gosh_alias=echo\n",
+			"$ ",
+			"gosh_alias arg || true\n",
+			"arg\n$ ",
+			"unalias gosh_alias\n",
+			"$ ",
+			"gosh_alias arg || true\n",
+			"\"gosh_alias\": executable file not found in $PATH\n$ ",
+		},
+	},
 }
 
 func TestInteractive(t *testing.T) {
 	t.Parallel()
 	for _, tc := range interactiveTests {
 		t.Run("", func(t *testing.T) {
-			inReader, inWriter := io.Pipe()
-			outReader, outWriter := io.Pipe()
-			runner, _ := interp.New(interp.StdIO(inReader, outWriter, outWriter))
+			inReader, inWriter, err := os.Pipe()
+			qt.Assert(t, qt.IsNil(err))
+			outReader, outWriter, err := os.Pipe()
+			qt.Assert(t, qt.IsNil(err))
+			runner, _ := interp.New(interp.Interactive(true), interp.StdIO(inReader, outWriter, outWriter))
 			errc := make(chan error, 1)
 			go func() {
 				errc <- runInteractive(runner, inReader, outWriter, outWriter)
 				// Discard the rest of the input.
 				io.Copy(io.Discard, inReader)
+				inReader.Close()
+				outWriter.Close()
 			}()
 
 			if err := readString(outReader, "$ "); err != nil {
@@ -215,7 +235,7 @@ func TestInteractive(t *testing.T) {
 			// so that any remaining prompt writes get discarded.
 			outReader.Close()
 
-			err := <-errc
+			err = <-errc
 			if err != nil && tc.wantErr == "" {
 				t.Fatalf("unexpected error: %v", err)
 			} else if tc.wantErr != "" && fmt.Sprint(err) != tc.wantErr {
@@ -226,11 +246,15 @@ func TestInteractive(t *testing.T) {
 }
 
 func TestInteractiveExit(t *testing.T) {
-	inReader, inWriter := io.Pipe()
+	inReader, inWriter, err := os.Pipe()
+	qt.Assert(t, qt.IsNil(err))
 	defer inReader.Close()
-	go io.WriteString(inWriter, "exit\n")
+	go func() {
+		io.WriteString(inWriter, "exit\n")
+		inWriter.Close()
+	}()
 	w := io.Discard
-	runner, _ := interp.New(interp.StdIO(inReader, w, w))
+	runner, _ := interp.New(interp.Interactive(true), interp.StdIO(inReader, w, w))
 	if err := runInteractive(runner, inReader, w, w); err != nil {
 		t.Fatal("expected a nil error")
 	}

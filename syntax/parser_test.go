@@ -10,11 +10,13 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/go-quicktest/qt"
 	"github.com/google/go-cmp/cmp"
 )
 
@@ -96,7 +98,6 @@ func TestParsePosOverflow(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			test := test
 			t.Parallel()
 
 			p := NewParser()
@@ -155,61 +156,45 @@ func TestParseBats(t *testing.T) {
 }
 
 func TestMain(m *testing.M) {
-	// Set the locale to computer-friendly English and UTF-8.
-	// Some systems like Arch miss C.UTF8, so fall back to the US English locale.
-	//
-	// TODO: glibc 2.35 was released with C.UTF-8 in February 2022.
-	// This locale is now becoming a standard, so remove the workaround in 2023.
-	if out, _ := exec.Command("locale", "-a").Output(); strings.Contains(
-		strings.ToLower(string(out)), "c.utf",
-	) {
-		os.Setenv("LANGUAGE", "C.UTF-8")
-		os.Setenv("LC_ALL", "C.UTF-8")
-	} else {
-		os.Setenv("LANGUAGE", "en_US.UTF-8")
-		os.Setenv("LC_ALL", "en_US.UTF-8")
-	}
+	// Set the locale to computer-friendly English and UTF-8, C.UTF-8,
+	// which started shipping with glibc 2.35 in February 2022.
+	os.Setenv("LANGUAGE", "C.UTF-8")
+	os.Setenv("LC_ALL", "C.UTF-8")
 	os.Exit(m.Run())
 }
 
 var (
-	storedHasBash51 bool
-	onceHasBash51   sync.Once
+	onceHasBash52 = sync.OnceValue(func() bool {
+		return cmdContains("version 5.2", "bash", "--version")
+	})
 
-	storedHasDash059 bool
-	onceHasDash059   sync.Once
+	onceHasDash059 = sync.OnceValue(func() bool {
+		// dash provides no way to check its version, so we have to
+		// check if it's new enough as to not have the bug that breaks
+		// our integration tests.
+		// This also means our check does not require a specific version.
+		return cmdContains("Bad subst", "dash", "-c", "echo ${#<}")
+	})
 
-	storedHasMksh59 bool
-	onceHasMksh59   sync.Once
+	onceHasMksh59 = sync.OnceValue(func() bool {
+		return cmdContains(" R59 ", "mksh", "-c", "echo $KSH_VERSION")
+	})
 )
 
-func hasBash51(tb testing.TB) {
-	onceHasBash51.Do(func() {
-		storedHasBash51 = cmdContains("version 5.1", "bash", "--version")
-	})
-	if !storedHasBash51 {
-		tb.Skipf("bash 5.1 required to run")
+func requireBash52(tb testing.TB) {
+	if !onceHasBash52() {
+		tb.Skipf("bash 5.2 required to run")
 	}
 }
 
-func hasDash059(tb testing.TB) {
-	// dash provides no way to check its version, so we have to
-	// check if it's new enough as to not have the bug that breaks
-	// our integration tests.
-	// This also means our check does not require a specific version.
-	onceHasDash059.Do(func() {
-		storedHasDash059 = cmdContains("Bad subst", "dash", "-c", "echo ${#<}")
-	})
-	if !storedHasDash059 {
+func requireDash059(tb testing.TB) {
+	if !onceHasDash059() {
 		tb.Skipf("dash 0.5.9+ required to run")
 	}
 }
 
-func hasMksh59(tb testing.TB) {
-	onceHasMksh59.Do(func() {
-		storedHasMksh59 = cmdContains(" R59 ", "mksh", "-c", "echo $KSH_VERSION")
-	})
-	if !storedHasMksh59 {
+func requireMksh59(tb testing.TB) {
+	if !onceHasMksh59() {
 		tb.Skipf("mksh 59 required to run")
 	}
 }
@@ -242,13 +227,13 @@ func confirmParse(in, cmd string, wantErr bool) func(*testing.T) {
 			// -n makes bash accept invalid inputs like
 			// "let" or "`{`", so only use it in
 			// non-erroring tests. Should be safe to not use
-			// -n anyway since these are supposed to just
-			// fail.
+			// -n anyway since these are supposed to just fail.
 			// also, -n will break if we are using extglob
 			// as extglob is not actually applied.
 			opts = append(opts, "-n")
 		}
 		cmd := exec.Command(cmd, opts...)
+		cmd.Dir = t.TempDir() // to be safe
 		cmd.Stdin = strings.NewReader(in)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
@@ -274,7 +259,7 @@ func TestParseBashConfirm(t *testing.T) {
 	if testing.Short() {
 		t.Skip("calling bash is slow.")
 	}
-	hasBash51(t)
+	requireBash52(t)
 	i := 0
 	for _, c := range append(fileTests, fileTestsNoPrint...) {
 		if c.Bash == nil {
@@ -292,7 +277,7 @@ func TestParsePosixConfirm(t *testing.T) {
 	if testing.Short() {
 		t.Skip("calling dash is slow.")
 	}
-	hasDash059(t)
+	requireDash059(t)
 	i := 0
 	for _, c := range append(fileTests, fileTestsNoPrint...) {
 		if c.Posix == nil {
@@ -310,7 +295,7 @@ func TestParseMirBSDKornConfirm(t *testing.T) {
 	if testing.Short() {
 		t.Skip("calling mksh is slow.")
 	}
-	hasMksh59(t)
+	requireMksh59(t)
 	i := 0
 	for _, c := range append(fileTests, fileTestsNoPrint...) {
 		if c.MirBSDKorn == nil {
@@ -328,7 +313,7 @@ func TestParseErrBashConfirm(t *testing.T) {
 	if testing.Short() {
 		t.Skip("calling bash is slow.")
 	}
-	hasBash51(t)
+	requireBash52(t)
 	for _, c := range shellTests {
 		want := c.common
 		if c.bsmk != nil {
@@ -349,7 +334,7 @@ func TestParseErrPosixConfirm(t *testing.T) {
 	if testing.Short() {
 		t.Skip("calling dash is slow.")
 	}
-	hasDash059(t)
+	requireDash059(t)
 	for _, c := range shellTests {
 		want := c.common
 		if c.posix != nil {
@@ -367,7 +352,7 @@ func TestParseErrMirBSDKornConfirm(t *testing.T) {
 	if testing.Short() {
 		t.Skip("calling mksh is slow.")
 	}
-	hasMksh59(t)
+	requireMksh59(t)
 	for _, c := range shellTests {
 		want := c.common
 		if c.bsmk != nil {
@@ -394,36 +379,7 @@ func singleParse(p *Parser, in string, want *File) func(t *testing.T) {
 			t.Fatalf("Unexpected error in %q: %v", in, err)
 		}
 		recursiveSanityCheck(t, in, got)
-		if diff := cmp.Diff(want, got, cmpOpt); diff != "" {
-			t.Errorf("syntax tree mismatch in %q (-want +got):\n%s", in, diff)
-		}
-	}
-}
-
-func BenchmarkParse(b *testing.B) {
-	b.ReportAllocs()
-	src := "" +
-		strings.Repeat("\n\n\t\t        \n", 10) +
-		"# " + strings.Repeat("foo bar ", 10) + "\n" +
-		strings.Repeat("longlit_", 10) + "\n" +
-		"'" + strings.Repeat("foo bar ", 10) + "'\n" +
-		`"` + strings.Repeat("foo bar ", 10) + `"` + "\n" +
-		strings.Repeat("aa bb cc dd; ", 6) +
-		"a() { (b); { c; }; }; $(d; `e`)\n" +
-		"foo=bar; a=b; c=d$foo${bar}e $simple ${complex:-default}\n" +
-		"if a; then while b; do for c in d e; do f; done; done; fi\n" +
-		"a | b && c || d | e && g || f\n" +
-		"foo >a <b <<<c 2>&1 <<EOF\n" +
-		strings.Repeat("somewhat long heredoc line\n", 10) +
-		"EOF" +
-		""
-	p := NewParser(KeepComments(true))
-	in := strings.NewReader(src)
-	for i := 0; i < b.N; i++ {
-		if _, err := p.Parse(in, ""); err != nil {
-			b.Fatal(err)
-		}
-		in.Reset(src)
+		qt.Assert(t, qt.CmpEquals(got, want, cmpOpt))
 	}
 }
 
@@ -810,6 +766,14 @@ var shellTests = []errorCase{
 	{
 		in:     "echo && > #",
 		common: `1:9: > must be followed by a word`,
+	},
+	{
+		in:    "foo &>/dev/null",
+		posix: `1:5: &> redirects are a bash/mksh feature`,
+	},
+	{
+		in:    "foo &>>/dev/null",
+		posix: `1:5: &> redirects are a bash/mksh feature`,
 	},
 	{
 		in:     "<<",
@@ -1333,7 +1297,7 @@ var shellTests = []errorCase{
 	},
 	{
 		in:     "`\\```",
-		common: "1:2: reached EOF without closing quote `",
+		common: "1:3: reached EOF without closing quote `",
 	},
 	{
 		in:     "`{\n`",
@@ -1834,7 +1798,7 @@ var shellTests = []errorCase{
 	},
 	{
 		in:   "echo ${foo@bar}",
-		bash: `1:12: invalid @ expansion operator #NOERR at runtime`,
+		bash: `1:12: invalid @ expansion operator "bar" #NOERR at runtime`,
 	},
 	{
 		in:   "echo ${foo@'Q'}",
@@ -1858,15 +1822,19 @@ var shellTests = []errorCase{
 	},
 	{
 		in:    "function foo() { bar; }",
-		posix: `1:13: the "function" builtin exists in bash; tried parsing as posix`,
+		posix: `1:13: the "function" builtin is a bash feature; tried parsing as posix`,
+	},
+	{
+		in:    "function foo { bar; }",
+		posix: `1:14: the "function" builtin is a bash feature; tried parsing as posix`,
 	},
 	{
 		in:    "declare foo=(bar)",
-		posix: `1:13: the "declare" builtin exists in bash; tried parsing as posix`,
+		posix: `1:13: the "declare" builtin is a bash feature; tried parsing as posix`,
 	},
 	{
 		in:    "let foo=(bar)",
-		posix: `1:9: the "let" builtin exists in bash; tried parsing as posix`,
+		posix: `1:9: the "let" builtin is a bash feature; tried parsing as posix`,
 	},
 	{
 		in:    "echo <(",
@@ -1991,6 +1959,10 @@ var shellTests = []errorCase{
 	},
 	{
 		in:   "echo ${foo@K}",
+		mksh: `1:12: this expansion operator is a bash feature`,
+	},
+	{
+		in:   "echo ${foo@k}",
 		mksh: `1:12: this expansion operator is a bash feature`,
 	},
 	{
@@ -2301,9 +2273,7 @@ func TestParseDocument(t *testing.T) {
 			}
 			recursiveSanityCheck(t, "", got)
 			want := &Word{Parts: tc.want}
-			if diff := cmp.Diff(want, got, cmpOpt); diff != "" {
-				t.Errorf("syntax tree mismatch in %q (-want +got):\n%s", tc.in, diff)
-			}
+			qt.Assert(t, qt.CmpEquals(got, want, cmpOpt))
 		})
 	}
 }
@@ -2396,9 +2366,7 @@ func TestParseArithmetic(t *testing.T) {
 				t.Fatal(err)
 			}
 			recursiveSanityCheck(t, "", got)
-			if diff := cmp.Diff(tc.want, got, cmpOpt); diff != "" {
-				t.Errorf("syntax tree mismatch in %q (-want +got):\n%s", tc.in, diff)
-			}
+			qt.Assert(t, qt.CmpEquals(got, tc.want, cmpOpt))
 		})
 	}
 }
@@ -2526,4 +2494,198 @@ func TestIsIncomplete(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPosEdgeCases(t *testing.T) {
+	in := "`\\\\foo`\n" + // one escaped backslash and 3 bytes
+		"\x00foo\x00bar\n" // 8 bytes and newline
+	p := NewParser()
+	f, err := p.Parse(strings.NewReader(in), "")
+	qt.Assert(t, qt.IsNil(err))
+	cmdSubst := f.Stmts[0].Cmd.(*CallExpr).Args[0].Parts[0].(*CmdSubst)
+	lit := cmdSubst.Stmts[0].Cmd.(*CallExpr).Args[0].Parts[0].(*Lit)
+
+	qt.Check(t, qt.Equals(lit.Value, lit.Value))
+	// Note that positions of literals with escape sequences inside backquote command substitutions
+	// are weird, since we effectively skip over the double escaping in the literal value and positions.
+	// Even though the input source has '\\foo' between columns 2 and 7 (length 5)
+	// we end up keeping '\foo' between columns 3 and 7 (length 4).
+	qt.Check(t, qt.Equals(lit.ValuePos.String(), "1:3"))
+	qt.Check(t, qt.Equals(lit.ValueEnd.String(), "1:7"))
+
+	// Check that we skip over null bytes when counting columns.
+	qt.Check(t, qt.Equals(f.Stmts[1].Pos().String(), "2:2"))
+	qt.Check(t, qt.Equals(f.Stmts[1].End().String(), "2:9"))
+}
+
+func TestParseRecoverErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		src string
+
+		wantErr     bool
+		wantMissing int
+	}{
+		{src: "foo;"},
+		{src: "foo"},
+		{
+			src:         "'incomp",
+			wantMissing: 1,
+		},
+		{
+			src:         "foo; 'incomp",
+			wantMissing: 1,
+		},
+		{
+			src:         "{ incomp",
+			wantMissing: 1,
+		},
+		{
+			src:         "(incomp",
+			wantMissing: 1,
+		},
+		{
+			src:         "(incomp; foo",
+			wantMissing: 1,
+		},
+		{
+			src:         "$(incomp",
+			wantMissing: 1,
+		},
+		{
+			src:         "((incomp",
+			wantMissing: 1,
+		},
+		{
+			src:         "$((incomp",
+			wantMissing: 1,
+		},
+		{
+			src:         "if foo",
+			wantMissing: 3,
+		},
+		{
+			src:         "if foo; then bar",
+			wantMissing: 1,
+		},
+		{
+			src:         "for i in 1 2 3; echo $i; done",
+			wantMissing: 1,
+		},
+		{
+			src:         `"incomp`,
+			wantMissing: 1,
+		},
+		{
+			src:         "`incomp",
+			wantMissing: 1,
+		},
+		{
+			src:         "incomp >",
+			wantMissing: 1,
+		},
+		{
+			src:         "${incomp",
+			wantMissing: 1,
+		},
+		{
+			src:         "incomp | ",
+			wantMissing: 1,
+		},
+		{
+			src:         "incomp || ",
+			wantMissing: 1,
+		},
+		{
+			src:         "incomp && ",
+			wantMissing: 1,
+		},
+		{
+			src:         `(one | { two >`,
+			wantMissing: 3,
+		},
+		{
+			src:         `(one > ; two | ); { three`,
+			wantMissing: 3,
+		},
+		{
+			src:     "badsyntax)",
+			wantErr: true,
+		},
+	}
+	parser := NewParser(RecoverErrors(3))
+	printer := NewPrinter()
+	for _, tc := range tests {
+		t.Run("", func(t *testing.T) {
+			t.Logf("input: %s", tc.src)
+			r := strings.NewReader(tc.src)
+			f, err := parser.Parse(r, "")
+			if tc.wantErr {
+				qt.Assert(t, qt.Not(qt.IsNil(err)))
+			} else {
+				qt.Assert(t, qt.IsNil(err))
+				switch len(f.Stmts) {
+				case 0:
+					t.Fatalf("result has no statements")
+				case 1:
+					if f.Stmts[0].Pos().IsRecovered() {
+						t.Fatalf("result is only a recovered statement")
+					}
+				}
+			}
+			qt.Assert(t, qt.Equals(countRecoveredPositions(reflect.ValueOf(f)), tc.wantMissing))
+
+			// Check that walking or printing the syntax tree still appears to work
+			// even when the input source was incomplete.
+			Walk(f, func(node Node) bool {
+				if node == nil {
+					return true
+				}
+				// Each position should either be valid, pointing to an offset within the input,
+				// or invalid, which could be due to the position being recovered.
+				for _, pos := range []Pos{node.Pos(), node.End()} {
+					qt.Assert(t, qt.IsFalse(pos.IsValid() && pos.IsRecovered()), qt.Commentf("positions cannot be valid and recovered"))
+					if !pos.IsValid() {
+						qt.Assert(t, qt.Equals(pos.Offset(), 0), qt.Commentf("invalid positions have no offset"))
+						qt.Assert(t, qt.Equals(pos.Line(), 0), qt.Commentf("invalid positions have no line"))
+						qt.Assert(t, qt.Equals(pos.Col(), 0), qt.Commentf("invalid positions have no column"))
+					}
+				}
+				return true
+			})
+			// Note that we don't particularly care about good formatting here.
+			printer.Print(io.Discard, f)
+		})
+	}
+}
+
+func countRecoveredPositions(x reflect.Value) int {
+	switch x.Kind() {
+	case reflect.Interface:
+		return countRecoveredPositions(x.Elem())
+	case reflect.Ptr:
+		if !x.IsNil() {
+			return countRecoveredPositions(x.Elem())
+		}
+	case reflect.Slice:
+		n := 0
+		for i := 0; i < x.Len(); i++ {
+			n += countRecoveredPositions(x.Index(i))
+		}
+		return n
+	case reflect.Struct:
+		if pos, ok := x.Interface().(Pos); ok {
+			if pos.IsRecovered() {
+				return 1
+			}
+			return 0
+		}
+		n := 0
+		for i := 0; i < x.NumField(); i++ {
+			n += countRecoveredPositions(x.Field(i))
+		}
+		return n
+	}
+	return 0
 }

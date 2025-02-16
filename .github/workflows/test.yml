@@ -4,14 +4,15 @@ jobs:
   test:
     strategy:
       matrix:
-        go-version: [1.19.x, 1.20.x]
-        os: [ubuntu-latest, macos-11, windows-latest]
+        go-version: [1.23.x, 1.24.x]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/setup-go@v3
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
       with:
         go-version: ${{ matrix.go-version }}
-    - uses: actions/checkout@v3
+        cache: false
 
     - run: go test ./...
 
@@ -19,25 +20,31 @@ jobs:
       if: matrix.os == 'ubuntu-latest'
     - run: GOARCH=386 go test -count=1 ./...
       if: matrix.os == 'ubuntu-latest'
-    - name: confirm tests with Bash 5.1
+    - name: confirm tests with Bash 5.2
       run: |
         go install mvdan.cc/dockexec@latest
-        CGO_ENABLED=0 go test -run TestRunnerRunConfirm -exec 'dockexec bash:5.1' ./interp
+        CGO_ENABLED=0 go test -run TestRunnerRunConfirm -exec 'dockexec bash:5.2' ./interp
       if: matrix.os == 'ubuntu-latest'
+
+    # Test that we can build for platforms that we can't currently test on.
+    - if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.24.x'
+      run: |
+        GOOS=plan9 GOARCH=amd64 go build ./...
+        GOOS=js GOARCH=wasm go build ./...
 
     # Static checks from this point forward. Only run on one Go version and on
     # Linux, since it's the fastest platform, and the tools behave the same.
-    - if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.20.x'
+    - if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.24.x'
       run: diff <(echo -n) <(gofmt -s -d .)
-    - if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.20.x'
+    - if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.24.x'
       run: go vet ./...
 
   test-linux-alpine:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Test as root, without cgo, and with busybox
-      run: docker run -v="$PWD:/pwd" -w=/pwd -e=CGO_ENABLED=0 golang:1.20.2-alpine go test ./...
+      run: docker run -v="$PWD:/pwd" -w=/pwd -e=CGO_ENABLED=0 golang:1.24.0-alpine go test ./...
 
   docker:
     name: Build and test Docker images
@@ -75,7 +82,7 @@ jobs:
       # Get "https://proxy.golang.org/...": local error: tls: unexpected message
       # Get "https://proxy.golang.org/...": x509: certificate signed by unknown authority
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0 # also fetch tags for 'git describe'
     # Enable docker daemon experimental support (for 'pull --platform').
@@ -88,8 +95,8 @@ jobs:
           echo '{ "experimental": true }' | sudo tee "$config"
         fi
         sudo systemctl restart docker
-    - uses: docker/setup-qemu-action@v2
-    - uses: docker/setup-buildx-action@v2
+    - uses: docker/setup-qemu-action@v3
+    - uses: docker/setup-buildx-action@v3
       with:
         driver-opts: network=host
     - name: Set up env vars
@@ -112,7 +119,7 @@ jobs:
         echo "DOCKER_BASE=test/${{ env.DOCKER_REPO }}" >> $GITHUB_ENV
         echo "DOCKER_BUILD_PLATFORMS=${DOCKER_PLATFORMS// /,}" >> $GITHUB_ENV
     - name: Build and push to local registry
-      uses: docker/build-push-action@v3
+      uses: docker/build-push-action@v5
       with:
         provenance: false # temporarily work around https://github.com/containers/skopeo/issues/1874
         context: .
@@ -121,7 +128,7 @@ jobs:
         push: true
         tags: localhost:5000/${{ env.DOCKER_BASE }}:${{ env.TAG }}
     - name: Build and push to local registry (alpine)
-      uses: docker/build-push-action@v3
+      uses: docker/build-push-action@v5
       with:
         provenance: false # temporarily work around https://github.com/containers/skopeo/issues/1874
         context: .
@@ -173,7 +180,7 @@ jobs:
         echo "DOCKER_DEPLOY_IMAGES=true" >> $GITHUB_ENV
     - name: Login to DockerHub
       if: ${{ env.DOCKER_DEPLOY_IMAGES == 'true' }}
-      uses: docker/login-action@v2
+      uses: docker/login-action@v3
       with:
         username: ${{ secrets.DOCKER_USER }}
         password: ${{ secrets.DOCKER_TOKEN }}
@@ -201,7 +208,7 @@ jobs:
         done
     - name: Update DockerHub description
       if: ${{ env.DOCKER_DEPLOY_IMAGES == 'true' }}
-      uses: peter-evans/dockerhub-description@v3
+      uses: peter-evans/dockerhub-description@v4
       with:
         username: ${{ secrets.DOCKER_USER }}
         password: ${{ secrets.DOCKER_TOKEN }}

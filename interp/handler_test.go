@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"runtime"
 	"strconv"
@@ -44,10 +45,10 @@ func blocklistNondevOpen(ctx context.Context, path string, flags int, mode os.Fi
 		return nil, fmt.Errorf("non-dev: %s", path)
 	}
 
-	return testOpenHandler(ctx, path, flags, mode)
+	return interp.DefaultOpenHandler()(ctx, path, flags, mode)
 }
 
-func blocklistGlob(ctx context.Context, path string) ([]os.FileInfo, error) {
+func blocklistGlob(ctx context.Context, path string) ([]fs.FileInfo, error) {
 	return nil, fmt.Errorf("blocklisted: glob")
 }
 
@@ -124,8 +125,9 @@ var modCases = []struct {
 		opts: []interp.RunnerOption{
 			interp.ExecHandlers(blocklistAllExec),
 		},
-		src:  "{ malicious; true; } & { malicious; true; } & wait",
-		want: "blocklisted: malicious",
+		src: "{ malicious; true; } & { malicious; true; } & wait",
+		// Note that "wait" with no arguments always succeeds.
+		want: "",
 	},
 	{
 		name: "ExecPrintWouldExec",
@@ -297,7 +299,6 @@ func TestKillTimeout(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run("", func(t *testing.T) {
 			t.Parallel()
 			file := parse(t, nil, test.src)
@@ -360,7 +361,6 @@ func TestKillSignal(t *testing.T) {
 	// signal directly. The program prints its PID and hangs forever.
 	file := parse(t, nil, "GOSH_CMD=pid_and_hang $GOSH_PROG")
 	for _, test := range tests {
-		test := test
 		t.Run(fmt.Sprintf("signal-%d", test.signal), func(t *testing.T) {
 			t.Parallel()
 

@@ -1,9 +1,84 @@
 # Changelog
 
-## [3.6.1] - 2023-??-??
+## [3.10.0] - 2024-10-20
 
+- **cmd/shfmt**
+  - Report the correct language variant in parser error messages - #1102
+  - Move `--filename` out of the parser options category - #1079
+- **syntax**
+  - Parse all CRLF line endings as LF, including inside heredocs - #1088
+  - Count skipped backslashes inside backticks in position column numbers - #1098
+  - Count skipped null bytes in position column numbers for consistency
 - **interp**
-  - Set `EUID` just like `UID`
+  - Fix a regression in `v3.9.0` which broke redirecting files to stdin - #1099
+  - Fix a regression in `v3.9.0` where `HandlerContext.Stdin` was never nil
+  - Add an `Interactive` option to be used by interactive shells - #1100
+  - Support closing stdin, stdout, and stderr via redirections like `<&-`
+
+Consider [becoming a sponsor](https://github.com/sponsors/mvdan) if you benefit from the work that went into this release!
+
+## [3.9.0] - 2024-08-16
+
+This release drops support for Go 1.21 and includes many fixes.
+
+- **cmd/shfmt**
+  - Switch the diff implementation to remove one dependency
+- **syntax**
+  - Protect against overflows in position offset integers
+- **interp**
+  - Use `os.Pipe` for stdin to prevent draining by subprocesses - #1085
+  - Support cancelling reads in builtins when stdin is a file - #1066
+  - Support the `nocaseglob` bash option - #1073
+  - Support the Bash 5.2 `@k` parameter expansion operator
+  - Support the `test -O` and `test -G` operators on non-Windows - #1080
+  - Support the `read -s` builtin flag - #1063
+- **expand**
+  - Add support for case insensitive globbing - #1073
+  - Don't panic when pattern words are nil - #1076
+
+A special thanks to @theclapp for their contributors to this release!
+
+Consider [becoming a sponsor](https://github.com/sponsors/mvdan) if you benefit from the work that went into this release!
+
+## [3.8.0] - 2024-02-11
+
+This release drops support for Go 1.19 and 1.20 and includes many
+features and bugfixes, such as improving EditorConfig support in `shfmt`.
+
+- **cmd/shfmt**
+  - Support EditorConfig language sections such as `[[shell]]` - #664
+  - Add `--apply-ignore` for tools and editors - #1037
+- **syntax**
+  - Allow formatting redirects before all command argumetnts - #942
+  - Support brace expansions with uppercase letters - #1042
+  - Unescape backquotes in single quotes within backquotes - #1041
+  - Better error when using `function` in POSIX mode - #993
+  - Better column numbers for escapes inside backquotes - #1028
+- **interp**
+  - Support parentheses in classic test commands - #1036
+  - Determine access to a directory via `unix.Access` - #1033
+  - Support subshells with `FuncEnviron` as `Env` - #1043
+  - Add support for `fs.DirEntry` via `ReadDirHandler2`
+- **expand**
+  - Add support for `fs.DirEntry` via `ReadDir2`
+  - Support zero-padding in brace expansions - #1042
+
+## [3.7.0] - 2023-06-18
+
+- **syntax**
+  - Correctly parse `$foo#bar` as a single word - #1003
+  - Make `&>` redirect operators an error in POSIX mode - #991
+  - Avoid producing invalid shell when minifying some heredocs - #923
+  - Revert the simplification of `${foo:-}` into `${foo-}` - #970
+- **interp**
+  - Add `ExecHandlers` to support layering multiple middlewares - #964
+  - Add initial support for the `select` clause - #969
+  - Support combining the `errexit` and `pipefail` options - #870
+  - Set `EUID` just like `UID` - #958
+  - Replace panics on unimplemented builtins with errors - #999
+  - Tweak build tags to support building for `js/wasm` - #983
+- **syntax/typedjson**
+  - Avoid `reflect.Value.MethodByName` to reduce binary sizes - #961
 
 ## [3.6.0] - 2022-12-11
 
@@ -661,6 +736,11 @@ module in v3.
 ## [0.1.0] - 2016-09-20
 
 Initial release.
+
+[3.10.0]: https://github.com/mvdan/sh/releases/tag/v3.10.0
+[3.9.0]: https://github.com/mvdan/sh/releases/tag/v3.9.0
+[3.8.0]: https://github.com/mvdan/sh/releases/tag/v3.8.0
+[3.7.0]: https://github.com/mvdan/sh/releases/tag/v3.7.0
 
 [3.6.0]: https://github.com/mvdan/sh/releases/tag/v3.6.0
 [#779]: https://github.com/mvdan/sh/issues/779

@@ -45,7 +45,6 @@ func TestRunnerTerminalStdIO(t *testing.T) {
 		for n in 0 1 2 3; do if [[ -t $n ]]; then echo -n $n; fi; done; echo end
 	`)
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -55,7 +54,7 @@ func TestRunnerTerminalStdIO(t *testing.T) {
 
 			r, _ := interp.New(interp.StdIO(secondaryReader, secondary, secondary))
 			go func() {
-				// To mimic os/exec.Cmd.Start, use a goroutine.
+				// To mimic [os/exec.Cmd.Start], use a goroutine.
 				if err := r.Run(context.Background(), file); err != nil {
 					t.Error(err)
 				}
@@ -125,7 +124,6 @@ func TestRunnerTerminalExec(t *testing.T) {
 		}, "012end\r\n"},
 	}
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 

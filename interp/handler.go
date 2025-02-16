@@ -7,13 +7,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"time"
 
 	"mvdan.cc/sh/v3/expand"
@@ -42,7 +42,11 @@ type HandlerContext struct {
 	// Dir is the interpreter's current directory.
 	Dir string
 
+	// TODO(v4): use an os.File for stdin below directly.
+
 	// Stdin is the interpreter's current standard input reader.
+	// It is always an [*os.File], but the type here remains an [io.Reader]
+	// due to backwards compatibility.
 	Stdin io.Reader
 	// Stdout is the interpreter's current standard output writer.
 	Stdout io.Writer
@@ -109,43 +113,34 @@ func DefaultExecHandler(killTimeout time.Duration) ExecHandlerFunc {
 
 		err = cmd.Start()
 		if err == nil {
-			if done := ctx.Done(); done != nil {
-				go func() {
-					<-done
-
-					if killTimeout <= 0 || runtime.GOOS == "windows" {
-						_ = cmd.Process.Signal(os.Kill)
-						return
-					}
-
-					// TODO: don't temporarily leak this goroutine
-					// if the program stops itself with the
-					// interrupt.
-					go func() {
-						time.Sleep(killTimeout)
-						_ = cmd.Process.Signal(os.Kill)
-					}()
-					_ = cmd.Process.Signal(os.Interrupt)
-				}()
-			}
+			stopf := context.AfterFunc(ctx, func() {
+				if killTimeout <= 0 || runtime.GOOS == "windows" {
+					_ = cmd.Process.Signal(os.Kill)
+					return
+				}
+				_ = cmd.Process.Signal(os.Interrupt)
+				// TODO: don't sleep in this goroutine if the program
+				// stops itself with the interrupt above.
+				time.Sleep(killTimeout)
+				_ = cmd.Process.Signal(os.Kill)
+			})
+			defer stopf()
 
 			err = cmd.Wait()
 		}
 
-		switch x := err.(type) {
+		switch err := err.(type) {
 		case *exec.ExitError:
-			// started, but errored - default to 1 if OS
-			// doesn't have exit statuses
-			if status, ok := x.Sys().(syscall.WaitStatus); ok {
-				if status.Signaled() {
-					if ctx.Err() != nil {
-						return ctx.Err()
-					}
-					return NewExitStatus(uint8(128 + status.Signal()))
+			// Windows and Plan9 do not have support for [syscall.WaitStatus]
+			// with methods like Signaled and Signal, so for those, [waitStatus] is a no-op.
+			// Note: [waitStatus] is an alias [syscall.WaitStatus]
+			if status, ok := err.Sys().(waitStatus); ok && status.Signaled() {
+				if ctx.Err() != nil {
+					return ctx.Err()
 				}
-				return NewExitStatus(uint8(status.ExitStatus()))
+				return NewExitStatus(uint8(128 + status.Signal()))
 			}
-			return NewExitStatus(1)
+			return NewExitStatus(uint8(err.ExitCode()))
 		case *exec.Error:
 			// did not start
 			fmt.Fprintf(hc.Stderr, "%v\n", err)
@@ -221,7 +216,7 @@ func LookPathDir(cwd string, env expand.Environ, file string) (string, error) {
 	return lookPathDir(cwd, env, file, findExecutable)
 }
 
-// findAny defines a function to pass to lookPathDir.
+// findAny defines a function to pass to [lookPathDir].
 type findAny = func(dir string, file string, exts []string) (string, error)
 
 func lookPathDir(cwd string, env expand.Environ, file string, find findAny) (string, error) {
@@ -257,7 +252,7 @@ func lookPathDir(cwd string, env expand.Environ, file string, find findAny) (str
 	return "", fmt.Errorf("%q: executable file not found in $PATH", file)
 }
 
-// scriptFromPathDir is similar to LookPathDir, with the difference that it looks
+// scriptFromPathDir is similar to [LookPathDir], with the difference that it looks
 // for both executable and non-executable files.
 func scriptFromPathDir(cwd string, env expand.Environ, file string) (string, error) {
 	return lookPathDir(cwd, env, file, findFile)
@@ -294,41 +289,64 @@ func pathExts(env expand.Environ) []string {
 // Use a return error of type [*os.PathError] to have the error printed to
 // stderr and the exit status set to 1. If the error is of any other type, the
 // interpreter will come to a stop.
+//
+// Note that implementations which do not return [os.File] will cause
+// extra files and goroutines for input redirections; see [StdIO].
 type OpenHandlerFunc func(ctx context.Context, path string, flag int, perm os.FileMode) (io.ReadWriteCloser, error)
+
+// TODO: paths passed to [OpenHandlerFunc] should be cleaned.
 
 // DefaultOpenHandler returns the [OpenHandlerFunc] used by default.
 // It uses [os.OpenFile] to open files.
+//
+// For the sake of portability, /dev/null opens NUL on Windows.
 func DefaultOpenHandler() OpenHandlerFunc {
 	return func(ctx context.Context, path string, flag int, perm os.FileMode) (io.ReadWriteCloser, error) {
 		mc := HandlerCtx(ctx)
-		if path != "" && !filepath.IsAbs(path) {
+		if runtime.GOOS == "windows" && path == "/dev/null" {
+			path = "NUL"
+			// Work around https://go.dev/issue/71752, where Go 1.24 started giving
+			// "Invalid handle" errors when opening "NUL" with O_TRUNC.
+			// TODO: hopefully remove this in the future once the bug is fixed.
+			flag &^= os.O_TRUNC
+		} else if path != "" && !filepath.IsAbs(path) {
 			path = filepath.Join(mc.Dir, path)
 		}
 		return os.OpenFile(path, flag, perm)
 	}
 }
 
+// TODO(v4): if this is kept in v4, it most likely needs to use [io/fs.DirEntry] for efficiency
+
 // ReadDirHandlerFunc is a handler which reads directories. It is called during
 // shell globbing, if enabled.
-//
-// TODO(v4): if this is kept in v4, it most likely needs to use [io/fs.DirEntry] for efficiency
-type ReadDirHandlerFunc func(ctx context.Context, path string) ([]os.FileInfo, error)
+type ReadDirHandlerFunc func(ctx context.Context, path string) ([]fs.FileInfo, error)
+
+type ReadDirHandlerFunc2 func(ctx context.Context, path string) ([]fs.DirEntry, error)
 
 // DefaultReadDirHandler returns the [ReadDirHandlerFunc] used by default.
 // It makes use of [ioutil.ReadDir].
 func DefaultReadDirHandler() ReadDirHandlerFunc {
-	return func(ctx context.Context, path string) ([]os.FileInfo, error) {
+	return func(ctx context.Context, path string) ([]fs.FileInfo, error) {
 		return ioutil.ReadDir(path)
 	}
 }
 
+// DefaultReadDirHandler2 returns the [ReadDirHandlerFunc2] used by default.
+// It uses [os.ReadDir].
+func DefaultReadDirHandler2() ReadDirHandlerFunc2 {
+	return func(ctx context.Context, path string) ([]fs.DirEntry, error) {
+		return os.ReadDir(path)
+	}
+}
+
 // StatHandlerFunc is a handler which gets a file's information.
-type StatHandlerFunc func(ctx context.Context, name string, followSymlinks bool) (os.FileInfo, error)
+type StatHandlerFunc func(ctx context.Context, name string, followSymlinks bool) (fs.FileInfo, error)
 
 // DefaultStatHandler returns the [StatHandlerFunc] used by default.
 // It makes use of [os.Stat] and [os.Lstat], depending on followSymlinks.
 func DefaultStatHandler() StatHandlerFunc {
-	return func(ctx context.Context, path string, followSymlinks bool) (os.FileInfo, error) {
+	return func(ctx context.Context, path string, followSymlinks bool) (fs.FileInfo, error) {
 		if !followSymlinks {
 			return os.Lstat(path)
 		} else {

@@ -14,18 +14,19 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-quicktest/qt"
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
 )
 
-// runnerRunTimeout is the context timeout used by any tests calling Runner.Run.
+// runnerRunTimeout is the context timeout used by any tests calling [Runner.Run].
 // The timeout saves us from hangs or burning too much CPU if there are bugs.
 // All the test cases are designed to be inexpensive and stop in a very short
 // amount of time, so 5s should be plenty even for busy machines.
@@ -81,11 +82,17 @@ let i=(2 + 3)
 	}
 }
 
-var hasBash50 bool
+var hasBash52 bool
 
 func TestMain(m *testing.M) {
 	if os.Getenv("GOSH_PROG") != "" {
 		switch os.Getenv("GOSH_CMD") {
+		case "exec_ok":
+			fmt.Printf("exec ok\n")
+			os.Exit(0)
+		case "exec_fail":
+			fmt.Printf("exec fail\n")
+			os.Exit(1)
 		case "pid_and_hang":
 			fmt.Println(os.Getpid())
 			time.Sleep(time.Hour)
@@ -109,7 +116,6 @@ func TestMain(m *testing.M) {
 		}
 		runner, _ := interp.New(
 			interp.StdIO(os.Stdin, os.Stdout, os.Stderr),
-			interp.OpenHandler(testOpenHandler),
 			interp.ExecHandlers(testExecHandler),
 		)
 		ctx := context.Background()
@@ -131,18 +137,11 @@ func TestMain(m *testing.M) {
 	os.Setenv("GOSH_PROG", prog)
 
 	// Mimic syntax/parser_test.go's TestMain.
-	if out, _ := exec.Command("locale", "-a").Output(); strings.Contains(
-		strings.ToLower(string(out)), "c.utf",
-	) {
-		os.Setenv("LANGUAGE", "C.UTF-8")
-		os.Setenv("LC_ALL", "C.UTF-8")
-	} else {
-		os.Setenv("LANGUAGE", "en_US.UTF-8")
-		os.Setenv("LC_ALL", "en_US.UTF-8")
-	}
+	os.Setenv("LANGUAGE", "C.UTF-8")
+	os.Setenv("LC_ALL", "C.UTF-8")
 
 	os.Unsetenv("CDPATH")
-	hasBash50 = checkBash()
+	hasBash52 = checkBash()
 
 	wd, err := os.Getwd()
 	if err != nil {
@@ -181,7 +180,7 @@ func checkBash() bool {
 	if err != nil {
 		return false
 	}
-	return strings.HasPrefix(string(out), "5.1")
+	return strings.HasPrefix(string(out), "5.2")
 }
 
 // concBuffer wraps a [bytes.Buffer] in a mutex so that concurrent writes
@@ -401,6 +400,11 @@ var runTests = []runTest{
 	{`echo \\\\`, "\\\\\n"},
 	{`echo \`, "\n"},
 
+	// escape characters in double quote literal
+	{`echo "\\"`, "\\\n"},     // special character is preserved
+	{`echo "\b"`, "\\b\n"},    // non-special character has both characters preserved
+	{`echo "\\\\"`, "\\\\\n"}, // sequential backslashes (escape characters repeated sequentially)
+
 	// vars
 	{"foo_interp_missing=bar_interp_missing; echo $foo_interp_missing", "bar_interp_missing\n"},
 	{"foo_interp_missing=bar_interp_missing foo_interp_missing=etc; echo $foo_interp_missing", "etc\n"},
@@ -516,6 +520,7 @@ var runTests = []runTest{
 	{"a='abcx1y'; echo ${a//x[[:digit:]]y}", "abc\n"},
 	{`a=xyz; echo "${a/y/a  b}"`, "xa  bz\n"},
 	{"a='foo_interp_missing/bar_interp_missing'; echo ${a//o*a/}", "fr_interp_missing\n"},
+	{"a=foobar; echo ${a//a/} ${a///b} ${a///}", "foobr foobar foobar\n"},
 	{
 		"echo ${a:-b}; echo $a; a=; echo ${a:-b}; a=c; echo ${a:-b}",
 		"b\n\nb\nc\n",
@@ -639,6 +644,30 @@ var runTests = []runTest{
 	{
 		"f() { local a; a=bad; a=good; echo $a; }; f",
 		"good\n",
+	},
+	{
+		`declare x; [[ -v x ]] && echo set || echo unset`,
+		"unset\n",
+	},
+	{
+		`declare x=; [[ -v x ]] && echo set || echo unset`,
+		"set\n",
+	},
+	{
+		`declare -a x; [[ -v x ]] && echo set || echo unset`,
+		"unset\n",
+	},
+	{
+		`declare -A x; [[ -v x ]] && echo set || echo unset`,
+		"unset\n",
+	},
+	{
+		`declare -r -x x; [[ -v x ]] && echo set || echo unset`,
+		"unset\n",
+	},
+	{
+		`declare -n x; [[ -v x ]] && echo set || echo unset`,
+		"unset\n",
 	},
 
 	// if
@@ -1257,6 +1286,10 @@ var runTests = []runTest{
 		"",
 	},
 	{
+		"echo foo_interp_missing >a; mkdir b; cd b; cat <../a",
+		"foo_interp_missing\n",
+	},
+	{
 		"echo foo_interp_missing >a; wc -c <a | tr -d ' '",
 		"19\n",
 	},
@@ -1309,6 +1342,10 @@ var runTests = []runTest{
 		"foo_interp_missing\\\nbar_interp_missing\n",
 	},
 	{
+		"cat <<EOF\nfoo\\\"bar\\baz\nEOF",
+		"foo\\\"bar\\baz\n",
+	},
+	{
 		"mkdir a; echo foo_interp_missing >a |& grep -q 'is a directory'",
 		" #IGNORE bash prints a warning",
 	},
@@ -1327,6 +1364,26 @@ var runTests = []runTest{
 	{
 		"mkdir a && cd a && echo foo_interp_missing >b && cd .. && cat a/b",
 		"foo_interp_missing\n",
+	},
+	{
+		"echo foo 2>&-; :",
+		"foo\n",
+	},
+	{
+		// `>&-` closes stdout or stderr. Note that any writes result in errors.
+		"echo foo >&- 2>&-; :",
+		"",
+	},
+	{
+		"echo foo | sed $(read line 2>/dev/null; echo 's/o/a/g')",
+		"",
+	},
+	{
+		// `<&-` closes stdin, to e.g. ensure that a subshell does not consume
+		// the standard input shared with the parent shell.
+		// Note that any reads result in errors.
+		"echo foo | sed $(exec <&-; read line 2>/dev/null; echo 's/o/a/g')",
+		"faa\n",
 	},
 
 	// background/wait
@@ -1616,6 +1673,10 @@ var runTests = []runTest{
 	{"set -n; [[ -o noexec ]]", ""}, // actually does nothing, but oh well
 	{"[[ -o pipefail ]]", "exit status 1"},
 	{"set -o pipefail; [[ -o pipefail ]]", ""},
+	// TODO: we don't implement precedence of && over ||.
+	// {"[[ a == x && b == x || c == c ]]", ""},
+	{"[[ (a == x && b == x) || c == c ]]", ""},
+	{"[[ a == x && (b == x || c == c) ]]", "exit status 1"},
 
 	// classic test
 	{
@@ -1713,6 +1774,10 @@ var runTests = []runTest{
 	{"[ a != a ]", "exit status 1"},
 	{"[ abc = ab* ]", "exit status 1"},
 	{"[ abc != ab* ]", ""},
+	// TODO: we don't implement precedence of -a over -o.
+	// {"[ a = x -a b = x -o c = c ]", ""},
+	{`[ \( a = x -a b = x \) -o c = c ]`, ""},
+	{`[ a = x -a \( b = x -o c = c \) ]`, "exit status 1"},
 
 	// arithm
 	{
@@ -2138,6 +2203,24 @@ done <<< 2`,
 		"shopt -s foo",
 		"shopt: invalid option name \"foo\"\nexit status 1 #JUSTERR",
 	},
+	{
+		// Beware that macOS file systems are by default case-preserving but
+		// case-insensitive, so e.g. "touch x X" creates only one file.
+		"touch a ab Ac Ad; shopt -u nocaseglob; echo a*",
+		"a ab\n",
+	},
+	{
+		"touch a ab Ac Ad; shopt -s nocaseglob; echo a*",
+		"Ac Ad a ab\n",
+	},
+	{
+		"touch a ab abB Ac Ad; shopt -u nocaseglob; echo *b",
+		"ab\n",
+	},
+	{
+		"touch a ab abB Ac Ad; shopt -s nocaseglob; echo *b",
+		"ab abB\n",
+	},
 
 	// IFS
 	{`echo -n "$IFS"`, " \t\n"},
@@ -2333,6 +2416,10 @@ done <<< 2`,
 		"a  1\nb  2\n",
 	},
 	{
+		`declare -a a; a[0]='a  1'; a[1]='b  2'; for e in "${a[@]}"; do echo "$e"; done`,
+		"a  1\nb  2\n",
+	},
+	{
 		`a=([1]=y [0]=x); echo ${a[0]}`,
 		"x\n",
 	},
@@ -2425,7 +2512,7 @@ done <<< 2`,
 		" x \n y \n",
 	},
 	{
-		`declare -A a=(['a  1']=' x ' ['b  2']=' y '); for v in "${a[*]}"; do echo "$v"; done | sort`,
+		`declare -A a=(['a  1']=' x ' ['b  2']=' y '); for v in "${a[*]}"; do echo "$v"; done`,
 		" x   y \n",
 	},
 	{
@@ -2433,10 +2520,17 @@ done <<< 2`,
 		"a  1\nb  2\n",
 	},
 	{
-		`declare -A a=(['a  1']=' x ' ['b  2']=' y '); for v in "${!a[*]}"; do echo "$v"; done | sort`,
+		`declare -A a=(['a  1']=' x ' ['b  2']=' y '); for v in "${!a[*]}"; do echo "$v"; done`,
 		"a  1 b  2\n",
 	},
-
+	{
+		`declare -A a; a[a]=x; a[b]=y; for v in "${!a[@]}"; do echo "$v"; done | sort`,
+		"a\nb\n",
+	},
+	{
+		`declare -A a; a[a]=x; a[b]=y; declare -A a; for v in "${!a[@]}"; do echo "$v"; done | sort`,
+		"a\nb\n",
+	},
 	// weird assignments
 	{"a=b; a=(c d); echo ${a[@]}", "c d\n"},
 	{"a=(b c); a=d; echo ${a[@]}", "d c\n"},
@@ -2815,6 +2909,10 @@ done <<< 2`,
 		"exit status 1",
 	},
 	{
+		"read 1</dev/null",
+		"exit status 1",
+	},
+	{
 		"read -X",
 		"read: invalid option \"-X\"\nexit status 2 #JUSTERR",
 	},
@@ -2871,6 +2969,23 @@ done <<< 2`,
 		"linecontinuation\n",
 	},
 	{
+		"while read a; do echo $a; GOSH_CMD=exec_ok $GOSH_PROG; done <<< 'a\nb\nc'",
+		"a\nexec ok\nb\nexec ok\nc\nexec ok\n",
+	},
+	{
+		"while read a; do echo $a; GOSH_CMD=exec_ok $GOSH_PROG; done <<EOF\na\nb\nc\nEOF",
+		"a\nexec ok\nb\nexec ok\nc\nexec ok\n",
+	},
+	{
+		"echo file1 >f; echo file2 >>f; while read a; do echo $a; done <f",
+		"file1\nfile2\n",
+	},
+	// TODO: our final exit status here isn't right.
+	// {
+	// 	"while read a; do echo $a; GOSH_CMD=exec_fail $GOSH_PROG; done <<< 'a\nb\nc'",
+	// 	"a\nexec fail\nb\nexec fail\nc\nexec fail\nexit status 1",
+	// },
+	{
 		`read -r a <<< '\\'; echo "$a"`,
 		"\\\\\n",
 	},
@@ -2901,6 +3016,22 @@ done <<< 2`,
 	{
 		"read -r -p 'Prompt and raw flag together: ' a <<< '\\a\\b\\c'; echo $a",
 		"Prompt and raw flag together: \\a\\b\\c\n #IGNORE bash requires a terminal",
+	},
+	{
+		`a=a; echo | (read a; echo -n "$a")`,
+		"",
+	},
+	{
+		`a=b; read a < /dev/null; echo -n "$a"`,
+		"",
+	},
+	{
+		"a=c; echo x | (read a; echo -n $a)",
+		"x",
+	},
+	{
+		"a=d; echo -n y | (read a; echo -n $a)",
+		"y",
 	},
 
 	// getopts
@@ -3148,16 +3279,23 @@ var runTestsUnix = []runTest{
 		"nested\n",
 	},
 	{
-		"echo foo_interp_missing bar_interp_missing > >(sed 's/o/e/g')",
+		// The tests here use "wait" because otherwise the parent may finish before
+		// the subprocess has had time to process the input and print the result.
+		"echo foo_interp_missing bar_interp_missing > >(sed 's/o/e/g'); wait",
 		"fee_interp_missing bar_interp_missing\n",
 	},
 	{
-		"echo foo_interp_missing bar_interp_missing | tee >(sed 's/o/e/g') >/dev/null",
+		"echo foo_interp_missing bar_interp_missing | tee >(sed 's/o/e/g') >/dev/null; wait",
 		"fee_interp_missing bar_interp_missing\n",
 	},
 	{
-		"echo nested > >(cat > >(cat))",
+		"echo nested > >(cat > >(cat); wait); wait",
 		"nested\n",
+	},
+	{
+		// The reader here does not consume the named pipe.
+		"test -e <(echo foo)",
+		"",
 	},
 	// echo trace
 	{
@@ -3416,7 +3554,6 @@ func TestRunnerRun(t *testing.T) {
 
 	p := syntax.NewParser()
 	for _, c := range runTests {
-		c := c
 		t.Run("", func(t *testing.T) {
 			skipIfUnsupported(t, c.in)
 
@@ -3431,7 +3568,6 @@ func TestRunnerRun(t *testing.T) {
 				// TODO: why does this make some tests hang?
 				// interp.Env(expand.ListEnviron(append(os.Environ(),
 				// 	"FOO_INTERP_MISSING_NULL_BAR_INTERP_MISSING=foo_interp_missing\x00bar_interp_missing")...)),
-				interp.OpenHandler(testOpenHandler),
 				interp.ExecHandlers(testExecHandler),
 			)
 			if err != nil {
@@ -3549,9 +3685,7 @@ var testBuiltinsMap = map[string]func(interp.HandlerContext, []string) error{
 		if err != nil {
 			return err
 		}
-		sort.Slice(lines, func(i, j int) bool {
-			return bytes.Compare(lines[i], lines[j]) < 0
-		})
+		slices.SortFunc(lines, bytes.Compare)
 		for _, line := range lines {
 			fmt.Fprintf(hc.Stdout, "%s\n", line)
 		}
@@ -3657,7 +3791,7 @@ var testBuiltinsMap = map[string]func(interp.HandlerContext, []string) error{
 		return os.Link(oldname, newname)
 	},
 	"touch": func(hc interp.HandlerContext, args []string) error {
-		filenames := args // create all arugments as filenames
+		filenames := args // create all arguments as filenames
 
 		newTime := time.Now()
 		if args[0] == "-t" {
@@ -3717,20 +3851,12 @@ func testExecHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	}
 }
 
-func testOpenHandler(ctx context.Context, path string, flag int, perm os.FileMode) (io.ReadWriteCloser, error) {
-	if runtime.GOOS == "windows" && path == "/dev/null" {
-		path = "NUL"
-	}
-
-	return interp.DefaultOpenHandler()(ctx, path, flag, perm)
-}
-
 func TestRunnerRunConfirm(t *testing.T) {
 	if testing.Short() {
 		t.Skip("calling bash is slow")
 	}
-	if !hasBash50 {
-		t.Skip("bash 5.0 required to run")
+	if !hasBash52 {
+		t.Skip("bash 5.2 required to run")
 	}
 	t.Parallel()
 
@@ -3740,7 +3866,6 @@ func TestRunnerRunConfirm(t *testing.T) {
 		t.Skip("bash on Windows emulates Unix-y behavior")
 	}
 	for _, c := range runTests {
-		c := c
 		t.Run("", func(t *testing.T) {
 			if strings.Contains(c.want, " #IGNORE") {
 				return
@@ -3867,6 +3992,16 @@ func TestRunnerOpts(t *testing.T) {
 			"set bar_interp_missing; echo $@",
 			"bar_interp_missing\n",
 		},
+		{
+			opts(interp.Env(expand.FuncEnviron(func(name string) string {
+				if name == "foo" {
+					return "bar"
+				}
+				return ""
+			}))),
+			"(echo $foo); echo x | echo $foo",
+			"bar\nbar\n",
+		},
 	}
 	p := syntax.NewParser()
 	for _, c := range cases {
@@ -3876,7 +4011,6 @@ func TestRunnerOpts(t *testing.T) {
 			var cb concBuffer
 			r, err := interp.New(append(c.opts,
 				interp.StdIO(nil, &cb, &cb),
-				interp.OpenHandler(testOpenHandler),
 				interp.ExecHandlers(testExecHandler),
 			)...)
 			if err != nil {
@@ -3931,6 +4065,50 @@ func TestRunnerContext(t *testing.T) {
 				t.Fatalf("program was not killed in %s", timeout)
 			}
 		})
+	}
+}
+
+func TestCancelBlockedStdinRead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// TODO: Why is this? The [os.File.SetReadDeadline] docs seem to imply that it should work
+		// across all major platforms, and the file polling  implementation seems to be
+		// for all posix platforms including Windows.
+		// Our previous logic and tests with muesli/cancelreader did not test an os.Pipe
+		// on Windows either, so skipping here is not any worse.
+		t.Skip("os.Pipe on windows appears to not support cancellable reads")
+	}
+	t.Parallel()
+
+	p := syntax.NewParser()
+	file := parse(t, p, "read x")
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	// Make the linter happy, even though we deliberately wait for the timeout.
+	defer cancel()
+
+	stdinRead, stdinWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Error calling os.Pipe: %v", err)
+	}
+	defer func() {
+		stdinWrite.Close()
+		stdinRead.Close()
+	}()
+	r, _ := interp.New(interp.StdIO(stdinRead, nil, nil))
+	now := time.Now()
+	errChan := make(chan error)
+	go func() {
+		errChan <- r.Run(ctx, file)
+	}()
+
+	timeout := 500 * time.Millisecond
+	select {
+	case err := <-errChan:
+		if err == nil || err.Error() != "exit status 1" || ctx.Err() != context.DeadlineExceeded {
+			t.Fatalf("'read x' did not timeout correctly; err: %v, ctx.Err(): %v; dur: %v",
+				err, ctx.Err(), time.Since(now))
+		}
+	case <-time.After(timeout):
+		t.Fatalf("program was not killed in %s", timeout)
 	}
 }
 
@@ -4090,7 +4268,6 @@ func TestRunnerResetFields(t *testing.T) {
 	r, _ := interp.New(
 		interp.Params("-f", "--", "first", tdir, logPath),
 		interp.Dir(tdir),
-		interp.OpenHandler(testOpenHandler),
 		interp.ExecHandlers(testExecHandler),
 	)
 	// Check that using option funcs and Runner fields directly is still
@@ -4229,7 +4406,7 @@ func TestReadShouldNotPanicWithNilStdin(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), runnerRunTimeout)
 	defer cancel()
 	if err := r.Run(ctx, f); err == nil {
-		t.Fatal("it should have retuned an error")
+		t.Fatal("it should have returned an error")
 	}
 }
 
@@ -4292,4 +4469,22 @@ func TestRunnerSubshell(t *testing.T) {
 	if want, got := "modified", r3.Vars["CHILD"].String(); got != want {
 		t.Fatalf("wrong output:\nwant: %q\ngot:  %q", want, got)
 	}
+}
+
+func TestRunnerNonFileStdin(t *testing.T) {
+	t.Parallel()
+
+	var cb concBuffer
+	r, err := interp.New(interp.StdIO(strings.NewReader("a\nb\nc\n"), &cb, &cb))
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := parse(t, nil, "while read a; do echo $a; GOSH_CMD=exec_ok $GOSH_PROG; done")
+	ctx, cancel := context.WithTimeout(context.Background(), runnerRunTimeout)
+	defer cancel()
+	if err := r.Run(ctx, file); err != nil {
+		cb.WriteString(err.Error())
+	}
+	// TODO: just like with heredocs, the first exec_ok call consumes all stdin.
+	qt.Assert(t, qt.Equals(cb.String(), "a\nexec ok\nb\nexec ok\nc\nexec ok\n"))
 }

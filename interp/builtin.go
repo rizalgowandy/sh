@@ -6,14 +6,18 @@ package interp
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
+
+	"golang.org/x/term"
 
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/syntax"
@@ -233,10 +237,8 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 		if len(args) > 0 {
 			panic("wait with args not handled yet")
 		}
-		err := r.bgShells.Wait()
-		if _, ok := IsExitStatus(err); err != nil && !ok {
-			r.setErr(err)
-		}
+		// Note that "wait" without arguments always returns exit status zero.
+		r.bgShells.Wait()
 	case "builtin":
 		if len(args) < 1 {
 			break
@@ -560,9 +562,12 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 	case "read":
 		var prompt string
 		raw := false
+		silent := false
 		fp := flagParser{remaining: args}
 		for fp.more() {
 			switch flag := fp.flag(); flag {
+			case "-s":
+				silent = true
 			case "-r":
 				raw = true
 			case "-p":
@@ -589,9 +594,12 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 			r.out(prompt)
 		}
 
-		line, err := r.readLine(raw)
-		if err != nil {
-			return 1
+		var line []byte
+		var err error
+		if silent {
+			line, err = term.ReadPassword(int(syscall.Stdin))
+		} else {
+			line, err = r.readLine(ctx, raw)
 		}
 		if len(args) == 0 {
 			args = append(args, shellReplyVar)
@@ -604,6 +612,12 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 				val = values[i]
 			}
 			r.setVarString(name, val)
+		}
+
+		// We can get data back from readLine and an error at the same time, so
+		// check err after we process the data.
+		if err != nil {
+			return 1
 		}
 
 		return 0
@@ -872,7 +886,7 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 			r.errf("%s: unable to read, %v\n", name, err)
 			return 2
 		}
-		r.setVarInternal(arrayName, vr)
+		r.setVar(arrayName, vr)
 
 		return 0
 
@@ -886,7 +900,7 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 
 // mapfileSplit returns a suitable Split function for a [bufio.Scanner];
 // the code is mostly stolen from [bufio.ScanLines].
-func mapfileSplit(delim byte, dropDelim bool) func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+func mapfileSplit(delim byte, dropDelim bool) bufio.SplitFunc {
 	return func(data []byte, atEOF bool) (advance int, token []byte, err error) {
 		if atEOF && len(data) == 0 {
 			return 0, nil, nil
@@ -917,7 +931,7 @@ func (r *Runner) printOptLine(name string, enabled, supported bool) {
 	r.outf("%s\t%s\t(%q not supported)\n", name, state, r.optStatusText(!enabled))
 }
 
-func (r *Runner) readLine(raw bool) ([]byte, error) {
+func (r *Runner) readLine(ctx context.Context, raw bool) ([]byte, error) {
 	if r.stdin == nil {
 		return nil, errors.New("interp: can't read, there's no stdin")
 	}
@@ -925,6 +939,19 @@ func (r *Runner) readLine(raw bool) ([]byte, error) {
 	var line []byte
 	esc := false
 
+	stopc := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		r.stdin.SetReadDeadline(time.Now())
+		close(stopc)
+	})
+	defer func() {
+		if !stop() {
+			// The AfterFunc was started.
+			// Wait for it to complete, and reset the file's deadline.
+			<-stopc
+			r.stdin.SetReadDeadline(time.Time{})
+		}
+	}()
 	for {
 		var buf [1]byte
 		n, err := r.stdin.Read(buf[:])
@@ -945,25 +972,20 @@ func (r *Runner) readLine(raw bool) ([]byte, error) {
 				esc = false
 			}
 		}
-		if err == io.EOF && len(line) > 0 {
-			return line, nil
-		}
 		if err != nil {
-			return nil, err
+			return line, err
 		}
 	}
 }
 
 func (r *Runner) changeDir(ctx context.Context, path string) int {
-	if path == "" {
-		path = "."
-	}
+	path = cmp.Or(path, ".")
 	path = r.absPath(path)
 	info, err := r.stat(ctx, path)
 	if err != nil || !info.IsDir() {
 		return 1
 	}
-	if !hasPermissionToDir(info) {
+	if !hasPermissionToDir(path) {
 		return 1
 	}
 	r.Dir = path

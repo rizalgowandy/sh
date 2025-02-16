@@ -6,7 +6,6 @@ package syntax
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -91,6 +90,9 @@ var printTests = []printCase{
 	{"if a; then b\nelse c\nfi", "if a; then\n\tb\nelse\n\tc\nfi"},
 	samePrint("foo >&2 <f bar"),
 	samePrint("foo >&2 bar <f"),
+	samePrint(">&2 foo bar <f"),
+	samePrint(">&2 foo"),
+	samePrint(">&2 foo 2>&1 bar <f"),
 	{"foo >&2>/dev/null", "foo >&2 >/dev/null"},
 	{"foo <<EOF bar\nl1\nEOF", "foo bar <<EOF\nl1\nEOF"},
 	samePrint("foo <<\\\\\\\\EOF\nbar\n\\\\EOF"),
@@ -620,7 +622,7 @@ var printTests = []printCase{
 	samePrint("#comment\n>redir"),
 	{
 		">redir \\\n\tfoo",
-		"foo >redir",
+		">redir foo",
 	},
 	samePrint("$(declare)"),
 	{
@@ -649,6 +651,13 @@ var printTests = []printCase{
 	},
 	samePrint("(\n\t((foo++))\n)"),
 	samePrint("(foo && bar)"),
+	samePrint(`$foo#bar ${foo}#bar 'foo'#bar "foo"#bar`),
+	// TODO: support cases with command substitutions as well
+	// {
+	// 	"`foo`#bar",
+	// 	"$(foo)#bar",
+	// },
+	// samePrint(`$("foo"#bar)#bar`),
 }
 
 func TestPrintWeirdFormat(t *testing.T) {
@@ -702,17 +711,6 @@ func TestPrintMultiline(t *testing.T) {
 	got = strings.ReplaceAll(got, "\r", "")
 	if got != want {
 		t.Fatalf("Print mismatch in canonical.sh")
-	}
-}
-
-func BenchmarkPrint(b *testing.B) {
-	b.ReportAllocs()
-	prog := parsePath(b, canonicalPath)
-	printer := NewPrinter()
-	for i := 0; i < b.N; i++ {
-		if err := printer.Print(io.Discard, prog); err != nil {
-			b.Fatal(err)
-		}
 	}
 }
 

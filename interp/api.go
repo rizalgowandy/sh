@@ -18,14 +18,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"maps"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/syntax"
@@ -73,7 +73,7 @@ type Runner struct {
 	// execHandler is responsible for executing programs. It must not be nil.
 	execHandler ExecHandlerFunc
 
-	// execMiddlewares grows with calls to ExecHandlers,
+	// execMiddlewares grows with calls to [ExecHandlers],
 	// and is used to construct execHandler when Reset is first called.
 	// The slice is needed to preserve the relative order of middlewares.
 	execMiddlewares []func(ExecHandlerFunc) ExecHandlerFunc
@@ -83,12 +83,12 @@ type Runner struct {
 
 	// readDirHandler is a function responsible for reading directories during
 	// glob expansion. It must be non-nil.
-	readDirHandler ReadDirHandlerFunc
+	readDirHandler ReadDirHandlerFunc2
 
 	// statHandler is a function responsible for getting file stat. It must be non-nil.
 	statHandler StatHandlerFunc
 
-	stdin  io.Reader
+	stdin  *os.File // e.g. the read end of a pipe
 	stdout io.Writer
 	stderr io.Writer
 
@@ -106,10 +106,6 @@ type Runner struct {
 
 	// rand is used mainly to generate temporary files.
 	rand *rand.Rand
-
-	// wgProcSubsts allows waiting for any process substitution sub-shells
-	// to finish running.
-	wgProcSubsts sync.WaitGroup
 
 	filename string // only if Node was a File
 
@@ -135,14 +131,14 @@ type Runner struct {
 	exit     int
 	lastExit int
 
-	bgShells errgroup.Group
+	bgShells sync.WaitGroup
 
 	opts runnerOpts
 
 	origDir    string
 	origParams []string
 	origOpts   runnerOpts
-	origStdin  io.Reader
+	origStdin  *os.File
 	origStdout io.Writer
 	origStderr io.Writer
 
@@ -186,19 +182,19 @@ func New(opts ...RunnerOption) (*Runner, error) {
 	r := &Runner{
 		usedNew:        true,
 		openHandler:    DefaultOpenHandler(),
-		readDirHandler: DefaultReadDirHandler(),
+		readDirHandler: DefaultReadDirHandler2(),
 		statHandler:    DefaultStatHandler(),
 	}
 	r.dirStack = r.dirBootstrap[:0]
+	// turn "on" the default Bash options
+	for i, opt := range bashOptsTable {
+		r.opts[len(shellOptsTable)+i] = opt.defaultState
+	}
+
 	for _, opt := range opts {
 		if err := opt(r); err != nil {
 			return nil, err
 		}
-	}
-
-	// turn "on" the default Bash options
-	for i, opt := range bashOptsTable {
-		r.opts[len(shellOptsTable)+i] = opt.defaultState
 	}
 
 	// Set the default fallbacks, if necessary.
@@ -220,8 +216,9 @@ func New(opts ...RunnerOption) (*Runner, error) {
 // It can also be applied directly on an existing Runner,
 // such as interp.Params("-e")(runner).
 // Note that options cannot be applied once Run or Reset have been called.
-// TODO: enforce that rule via didReset.
 type RunnerOption func(*Runner) error
+
+// TODO: enforce the rule above via didReset.
 
 // Env sets the interpreter's environment. If nil, a copy of the current
 // process's environment is used.
@@ -259,6 +256,16 @@ func Dir(path string) RunnerOption {
 			return fmt.Errorf("%s is not a directory", path)
 		}
 		r.Dir = path
+		return nil
+	}
+}
+
+// Interactive configures the interpreter to behave like an interactive shell,
+// akin to Bash. Currently, this only enables the expansion of aliases,
+// but later on it should also change other behavior.
+func Interactive(enabled bool) RunnerOption {
+	return func(r *Runner) error {
+		r.opts[optExpandAliases] = enabled
 		return nil
 	}
 }
@@ -366,12 +373,12 @@ func ExecHandlers(middlewares ...func(next ExecHandlerFunc) ExecHandlerFunc) Run
 	}
 }
 
-// TODO: consider porting the middleware API in ExecHandlers to OpenHandler,
+// TODO: consider porting the middleware API in [ExecHandlers] to [OpenHandler],
 // ReadDirHandler, and StatHandler.
 
-// TODO(v4): now that ExecHandlers allows calling a next handler with changed
-// arguments, one of the two advantages of CallHandler is gone. The other is the
-// ability to work with builtins; if we make ExecHandlers work with builtins, we
+// TODO(v4): now that [ExecHandlers] allows calling a next handler with changed
+// arguments, one of the two advantages of [CallHandler] is gone. The other is the
+// ability to work with builtins; if we make [ExecHandlers] work with builtins, we
 // could join both APIs.
 
 // OpenHandler sets file open handler. See [OpenHandlerFunc] for more info.
@@ -383,7 +390,27 @@ func OpenHandler(f OpenHandlerFunc) RunnerOption {
 }
 
 // ReadDirHandler sets the read directory handler. See [ReadDirHandlerFunc] for more info.
+//
+// Deprecated: use [ReadDirHandler2].
 func ReadDirHandler(f ReadDirHandlerFunc) RunnerOption {
+	return func(r *Runner) error {
+		r.readDirHandler = func(ctx context.Context, path string) ([]fs.DirEntry, error) {
+			infos, err := f(ctx, path)
+			if err != nil {
+				return nil, err
+			}
+			entries := make([]fs.DirEntry, len(infos))
+			for i, info := range infos {
+				entries[i] = fs.FileInfoToDirEntry(info)
+			}
+			return entries, nil
+		}
+		return nil
+	}
+}
+
+// ReadDirHandler2 sets the read directory handler. See [ReadDirHandlerFunc2] for more info.
+func ReadDirHandler2(f ReadDirHandlerFunc2) RunnerOption {
 	return func(r *Runner) error {
 		r.readDirHandler = f
 		return nil
@@ -398,12 +425,45 @@ func StatHandler(f StatHandlerFunc) RunnerOption {
 	}
 }
 
+func stdinFile(r io.Reader) (*os.File, error) {
+	switch r := r.(type) {
+	case *os.File:
+		return r, nil
+	case nil:
+		return nil, nil
+	default:
+		pr, pw, err := os.Pipe()
+		if err != nil {
+			return nil, err
+		}
+		go func() {
+			io.Copy(pw, r)
+			pw.Close()
+		}()
+		return pr, nil
+	}
+}
+
 // StdIO configures an interpreter's standard input, standard output, and
 // standard error. If out or err are nil, they default to a writer that discards
 // the output.
+//
+// Note that providing a non-nil standard input other than [*os.File] will require
+// an [os.Pipe] and spawning a goroutine to copy into it,
+// as an [os.File] is the only way to share a reader with subprocesses.
+// This may cause the interpreter to consume the entire reader.
+// See [os/exec.Cmd.Stdin].
+//
+// When providing an [*os.File] as standard input, consider using an [os.Pipe]
+// as it has the best chance to support cancellable reads via [os.File.SetReadDeadline],
+// so that cancelling the runner's context can stop a blocked standard input read.
 func StdIO(in io.Reader, out, err io.Writer) RunnerOption {
 	return func(r *Runner) error {
-		r.stdin = in
+		stdin, _err := stdinFile(in)
+		if _err != nil {
+			return _err
+		}
+		r.stdin = stdin
 		if out == nil {
 			out = io.Discard
 		}
@@ -468,6 +528,11 @@ var bashOptsTable = [...]bashOpt{
 	},
 	{
 		name:         "globstar",
+		defaultState: false,
+		supported:    true,
+	},
+	{
+		name:         "nocaseglob",
 		defaultState: false,
 		supported:    true,
 	},
@@ -543,7 +608,6 @@ var bashOptsTable = [...]bashOpt{
 	{name: "login_shell"},
 	{name: "mailwarn"},
 	{name: "no_empty_cmd_completion"},
-	{name: "nocaseglob"},
 	{name: "nocasematch"},
 	{
 		name:         "progcomp",
@@ -567,6 +631,7 @@ var bashOptsTable = [...]bashOpt{
 // know which option we're after at compile time. First come the shell options,
 // then the bash options.
 const (
+	// These correspond to indexes in [shellOptsTable]
 	optAllExport = iota
 	optErrExit
 	optNoExec
@@ -575,8 +640,11 @@ const (
 	optXTrace
 	optPipeFail
 
+	// These correspond to indexes (offset by the above seven items) of
+	// supported options in [bashOptsTable]
 	optExpandAliases
 	optGlobStar
+	optNoCaseGlob
 	optNullGlob
 )
 
@@ -621,7 +689,7 @@ func (r *Runner) Reset() {
 		readDirHandler: r.readDirHandler,
 		statHandler:    r.statHandler,
 
-		// These can be set by functions like Dir or Params, but
+		// These can be set by functions like [Dir] or [Params], but
 		// builtins can overwrite them; reset the fields to whatever the
 		// constructor set up.
 		Dir:    r.origDir,
@@ -646,9 +714,7 @@ func (r *Runner) Reset() {
 	if r.Vars == nil {
 		r.Vars = make(map[string]expand.Variable)
 	} else {
-		for k := range r.Vars {
-			delete(r.Vars, k)
-		}
+		clear(r.Vars)
 	}
 	// TODO(v4): Use the supplied Env directly if it implements enough methods.
 	r.writeEnv = &overlayEnviron{parent: r.Env}
@@ -657,21 +723,24 @@ func (r *Runner) Reset() {
 		r.setVarString("HOME", home)
 	}
 	if !r.writeEnv.Get("UID").IsSet() {
-		r.setVar("UID", nil, expand.Variable{
+		r.setVar("UID", expand.Variable{
+			Set:      true,
 			Kind:     expand.String,
 			ReadOnly: true,
 			Str:      strconv.Itoa(os.Getuid()),
 		})
 	}
 	if !r.writeEnv.Get("EUID").IsSet() {
-		r.setVar("EUID", nil, expand.Variable{
+		r.setVar("EUID", expand.Variable{
+			Set:      true,
 			Kind:     expand.String,
 			ReadOnly: true,
 			Str:      strconv.Itoa(os.Geteuid()),
 		})
 	}
 	if !r.writeEnv.Get("GID").IsSet() {
-		r.setVar("GID", nil, expand.Variable{
+		r.setVar("GID", expand.Variable{
+			Set:      true,
 			Kind:     expand.String,
 			ReadOnly: true,
 			Str:      strconv.Itoa(os.Getgid()),
@@ -705,15 +774,15 @@ func IsExitStatus(err error) (status uint8, ok bool) {
 	return 0, false
 }
 
-// Run interprets a node, which can be a *File, *Stmt, or Command. If a non-nil
+// Run interprets a node, which can be a [*File], [*Stmt], or [Command]. If a non-nil
 // error is returned, it will typically contain a command's exit status, which
-// can be retrieved with IsExitStatus.
+// can be retrieved with [IsExitStatus].
 //
 // Run can be called multiple times synchronously to interpret programs
-// incrementally. To reuse a Runner without keeping the internal shell state,
+// incrementally. To reuse a [Runner] without keeping the internal shell state,
 // call Reset.
 //
-// Calling Run on an entire *File implies an exit, meaning that an exit trap may
+// Calling Run on an entire [*File] implies an exit, meaning that an exit trap may
 // run.
 func (r *Runner) Run(ctx context.Context, node syntax.Node) error {
 	if !r.didReset {
@@ -723,28 +792,25 @@ func (r *Runner) Run(ctx context.Context, node syntax.Node) error {
 	r.err = nil
 	r.shellExited = false
 	r.filename = ""
-	switch x := node.(type) {
+	switch node := node.(type) {
 	case *syntax.File:
-		r.filename = x.Name
-		r.stmts(ctx, x.Stmts)
+		r.filename = node.Name
+		r.stmts(ctx, node.Stmts)
 		if !r.shellExited {
 			r.exitShell(ctx, r.exit)
 		}
 	case *syntax.Stmt:
-		r.stmt(ctx, x)
+		r.stmt(ctx, node)
 	case syntax.Command:
-		r.cmd(ctx, x)
+		r.cmd(ctx, node)
 	default:
-		return fmt.Errorf("node can only be File, Stmt, or Command: %T", x)
+		return fmt.Errorf("node can only be File, Stmt, or Command: %T", node)
 	}
 	if r.exit != 0 {
 		r.setErr(NewExitStatus(uint8(r.exit)))
 	}
 	if r.Vars != nil {
-		r.writeEnv.Each(func(name string, vr expand.Variable) bool {
-			r.Vars[name] = vr
-			return true
-		})
+		maps.Insert(r.Vars, r.writeEnv.Each)
 	}
 	return r.err
 }
@@ -758,12 +824,12 @@ func (r *Runner) Exited() bool {
 	return r.shellExited
 }
 
-// Subshell makes a copy of the given Runner, suitable for use concurrently
+// Subshell makes a copy of the given [Runner], suitable for use concurrently
 // with the original. The copy will have the same environment, including
 // variables and functions, but they can all be modified without affecting the
 // original.
 //
-// Subshell is not safe to use concurrently with Run. Orchestrating this is
+// Subshell is not safe to use concurrently with [Run]. Orchestrating this is
 // left up to the caller; no locking is performed.
 //
 // To replace e.g. stdin/out/err, do StdIO(r.stdin, r.stdout, r.stderr)(r) on
@@ -773,7 +839,7 @@ func (r *Runner) Subshell() *Runner {
 		r.Reset()
 	}
 	// Keep in sync with the Runner type. Manually copy fields, to not copy
-	// sensitive ones like errgroup.Group, and to do deep copies of slices.
+	// sensitive ones like [errgroup.Group], and to do deep copies of slices.
 	r2 := &Runner{
 		Dir:            r.Dir,
 		Params:         r.Params,
@@ -793,39 +859,13 @@ func (r *Runner) Subshell() *Runner {
 
 		origStdout: r.origStdout, // used for process substitutions
 	}
-	// Env vars and funcs are copied, since they might be modified.
-	// TODO(v4): lazy copying? it would probably be enough to add a
-	// copyOnWrite bool field to Variable, then a Modify method that must be
-	// used when one needs to modify a variable. ideally with some way to
-	// catch direct modifications without the use of Modify and panic,
-	// perhaps via a check when getting or setting vars at some level.
-	oenv := &overlayEnviron{parent: expand.ListEnviron()}
-	r.writeEnv.Each(func(name string, vr expand.Variable) bool {
-		vr2 := vr
-		// Make deeper copies of List and Map, but ensure that they remain nil
-		// if they are nil in vr.
-		vr2.List = append([]string(nil), vr.List...)
-		if vr.Map != nil {
-			vr2.Map = make(map[string]string, len(vr.Map))
-			for k, vr := range vr.Map {
-				vr2.Map[k] = vr
-			}
-		}
-		oenv.Set(name, vr2)
-		return true
-	})
+	// Funcs are copied, since they might be modified.
+	// Env vars aren't copied; setVar will copy lists and maps as needed.
+	oenv := &overlayEnviron{parent: r.writeEnv}
 	r2.writeEnv = oenv
-	r2.Funcs = make(map[string]*syntax.Stmt, len(r.Funcs))
-	for k, v := range r.Funcs {
-		r2.Funcs[k] = v
-	}
+	r2.Funcs = maps.Clone(r.Funcs)
 	r2.Vars = make(map[string]expand.Variable)
-	if l := len(r.alias); l > 0 {
-		r2.alias = make(map[string]alias, l)
-		for k, v := range r.alias {
-			r2.alias[k] = v
-		}
-	}
+	r2.alias = maps.Clone(r.alias)
 
 	r2.dirStack = append(r2.dirBootstrap[:0], r.dirStack...)
 	r2.fillExpandConfig(r.ectx)

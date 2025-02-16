@@ -4,8 +4,9 @@
 package expand
 
 import (
+	"cmp"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -29,6 +30,11 @@ type Environ interface {
 	Each(func(name string, vr Variable) bool)
 }
 
+// TODO(v4): [WriteEnviron.Set] below is overloaded to the point that correctly
+// implementing both sides of the interface is tricky. In particular, some operations
+// such as `export foo` or `readonly foo` alter the attributes but not the value,
+// and `foo=bar` or `foo=[3]=baz` alter the value but not the attributes.
+
 // WriteEnviron is an extension on Environ that supports modifying and deleting
 // variables.
 type WriteEnviron interface {
@@ -36,40 +42,54 @@ type WriteEnviron interface {
 	// Set sets a variable by name. If !vr.IsSet(), the variable is being
 	// unset; otherwise, the variable is being replaced.
 	//
-	// It is the implementation's responsibility to handle variable
-	// attributes correctly. For example, changing an exported variable's
-	// value does not unexport it, and overwriting a name reference variable
-	// should modify its target.
+	// The given variable can have the kind [KeepValue] to replace an existing
+	// variable's attributes without changing its value at all.
+	// This is helpful to implement `readonly foo=bar; export foo`,
+	// as the second declaration needs to clearly signal that the value is not modified.
 	//
 	// An error may be returned if the operation is invalid, such as if the
 	// name is empty or if we're trying to overwrite a read-only variable.
 	Set(name string, vr Variable) error
 }
 
+//go:generate stringer -type=ValueKind
+
+// ValueKind describes which kind of value the variable holds.
+// While most unset variables will have an [Unknown] kind, an unset variable may
+// have a kind associated too, such as via `declare -a foo` resulting in [Indexed].
 type ValueKind uint8
 
 const (
-	Unset ValueKind = iota
+	// Unknown is used for unset variables which do not have a kind yet.
+	Unknown ValueKind = iota
+	// String describes plain string variables, such as `foo=bar`.
 	String
+	// NameRef describes variables which reference another by name, such as `declare -n foo=foo2`.
 	NameRef
+	// Indexed describes indexed array variables, such as `foo=(bar baz)`.
 	Indexed
+	// Associative describes associative array variables, such as `foo=([bar]=x [baz]=y)`.
 	Associative
+
+	// KeepValue is used by [WriteEnviron.Set] to signal that we are changing attributes
+	// about a variable, such as exporting it, without changing its value at all.
+	KeepValue
+
+	// Deprecated: use [Unknown], as tracking whether or not a variable is set
+	// is now done via [Variable.Set].
+	Unset = Unknown
 )
 
 // Variable describes a shell variable, which can have a number of attributes
 // and a value.
-//
-// A Variable is unset if its Kind field is Unset, which can be checked via
-// [Variable.IsSet]. The zero value of a Variable is thus a valid unset variable.
-//
-// If a variable is set, its Value field will be a []string if it is an indexed
-// array, a map[string]string if it's an associative array, or a string
-// otherwise.
 type Variable struct {
+	Set bool
+
 	Local    bool
 	Exported bool
 	ReadOnly bool
 
+	// Kind defines which of the value fields below should be used.
 	Kind ValueKind
 
 	Str  string            // Used when Kind is String or NameRef.
@@ -77,10 +97,17 @@ type Variable struct {
 	Map  map[string]string // Used when Kind is Associative.
 }
 
-// IsSet returns whether the variable is set. An empty variable is set, but an
-// undeclared variable is not.
+// IsSet reports whether the variable has been set to a value.
+// The zero value of a Variable is unset.
 func (v Variable) IsSet() bool {
-	return v.Kind != Unset
+	return v.Set
+}
+
+// Declared reports whether the variable has been declared.
+// Declared variables may not be set; `export foo` is exported but not set to a value,
+// and `declare -a foo` is an indexed array but not set to a value.
+func (v Variable) Declared() bool {
+	return v.Set || v.Local || v.Exported || v.ReadOnly || v.Kind != Unknown
 }
 
 // String returns the variable's value as a string. In general, this only makes
@@ -119,7 +146,7 @@ func (v Variable) Resolve(env Environ) (string, Variable) {
 }
 
 // FuncEnviron wraps a function mapping variable names to their string values,
-// and implements Environ. Empty strings returned by the function will be
+// and implements [Environ]. Empty strings returned by the function will be
 // treated as unset variables. All variables will be exported.
 //
 // Note that the returned Environ's Each method will be a no-op.
@@ -134,12 +161,12 @@ func (f funcEnviron) Get(name string) Variable {
 	if value == "" {
 		return Variable{}
 	}
-	return Variable{Exported: true, Kind: String, Str: value}
+	return Variable{Set: true, Exported: true, Kind: String, Str: value}
 }
 
 func (f funcEnviron) Each(func(name string, vr Variable) bool) {}
 
-// ListEnviron returns an Environ with the supplied variables, in the form
+// ListEnviron returns an [Environ] with the supplied variables, in the form
 // "key=value". All variables will be exported. The last value in pairs is used
 // if multiple values are present.
 //
@@ -149,10 +176,10 @@ func ListEnviron(pairs ...string) Environ {
 	return listEnvironWithUpper(runtime.GOOS == "windows", pairs...)
 }
 
-// listEnvironWithUpper implements ListEnviron, but letting the tests specify
+// listEnvironWithUpper implements [ListEnviron], but letting the tests specify
 // whether to uppercase all names or not.
 func listEnvironWithUpper(upper bool, pairs ...string) Environ {
-	list := append([]string{}, pairs...)
+	list := slices.Clone(pairs)
 	if upper {
 		// Uppercase before sorting, so that we can remove duplicates
 		// without the need for linear search nor a map.
@@ -163,9 +190,9 @@ func listEnvironWithUpper(upper bool, pairs ...string) Environ {
 		}
 	}
 
-	sort.SliceStable(list, func(i, j int) bool {
-		isep := strings.IndexByte(list[i], '=')
-		jsep := strings.IndexByte(list[j], '=')
+	slices.SortStableFunc(list, func(a, b string) int {
+		isep := strings.IndexByte(a, '=')
+		jsep := strings.IndexByte(b, '=')
 		if isep < 0 {
 			isep = 0
 		} else {
@@ -176,7 +203,7 @@ func listEnvironWithUpper(upper bool, pairs ...string) Environ {
 		} else {
 			jsep += 1
 		}
-		return list[i][:isep] < list[j][:jsep]
+		return strings.Compare(a[:isep], b[:jsep])
 	})
 
 	last := ""
@@ -204,10 +231,23 @@ func listEnvironWithUpper(upper bool, pairs ...string) Environ {
 type listEnviron []string
 
 func (l listEnviron) Get(name string) Variable {
-	prefix := name + "="
-	i := sort.SearchStrings(l, prefix)
-	if i < len(l) && strings.HasPrefix(l[i], prefix) {
-		return Variable{Exported: true, Kind: String, Str: strings.TrimPrefix(l[i], prefix)}
+	eqpos := len(name)
+	endpos := len(name) + 1
+	i, ok := slices.BinarySearchFunc(l, name, func(l, name string) int {
+		if len(l) < endpos {
+			// Too short; see if we are before or after the name.
+			return strings.Compare(l, name)
+		}
+		// Compare the name prefix, then the equal character.
+		c := strings.Compare(l[:eqpos], name)
+		eq := l[eqpos]
+		if c == 0 {
+			return cmp.Compare(eq, '=')
+		}
+		return c
+	})
+	if ok {
+		return Variable{Set: true, Exported: true, Kind: String, Str: l[i][endpos:]}
 	}
 	return Variable{}
 }
@@ -220,7 +260,7 @@ func (l listEnviron) Each(fn func(name string, vr Variable) bool) {
 			panic("expand.listEnviron: did not expect malformed name-value pair: " + pair)
 		}
 		name, value := pair[:i], pair[i+1:]
-		if !fn(name, Variable{Exported: true, Kind: String, Str: value}) {
+		if !fn(name, Variable{Set: true, Exported: true, Kind: String, Str: value}) {
 			return
 		}
 	}

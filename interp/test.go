@@ -179,7 +179,7 @@ func (r *Runner) unTest(ctx context.Context, op syntax.UnTestOperator, x string)
 			f = r.stderr
 		}
 		if f, ok := f.(interface{ Fd() uintptr }); ok {
-			// Support Fd methods such as the one on *os.File.
+			// Support [os.File.Fd] methods such as the one on [*os.File].
 			return term.IsTerminal(int(f.Fd()))
 		}
 		// TODO: allow term.IsTerminal here too if running in the
@@ -200,6 +200,8 @@ func (r *Runner) unTest(ctx context.Context, op syntax.UnTestOperator, x string)
 		return r.lookupVar(x).Kind == expand.NameRef
 	case syntax.TsNot:
 		return x == ""
+	case syntax.TsUsrOwn, syntax.TsGrpOwn:
+		return r.unTestOwnOrGrp(ctx, op, x)
 	default:
 		panic(fmt.Sprintf("unhandled unary test op: %v", op))
 	}
